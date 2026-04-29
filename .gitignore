@@ -1,0 +1,14 @@
+# xv6-riscv build artifacts
+*.o
+*.d
+*.asm
+*.sym
+kernel/kernel
+user/initcode
+user/initcode.out
+mkfs/mkfs
+.gdbinit
+.gdb_history
+fs.img
+xv6.img
+.DS_Store

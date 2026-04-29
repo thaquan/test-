@@ -1,0 +1,158 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d133cd3..cf737ee 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -187,6 +187,7 @@ void            vmprint(pagetable_t);
+ #ifdef LAB_PGTBL
+ pte_t*          pgpte(pagetable_t, uint64);
+ #endif
++void            vmprint(pagetable_t);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 6d7c452..6551160 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -127,7 +127,7 @@ exec(char *path, char **argv)
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+-
++  if(p->pid == 1) vmprint(p->pagetable);
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 130d9ce..e62fbe6 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -131,7 +131,12 @@ found:
+     release(&p->lock);
+     return 0;
+   }
+-
++if((p->usyscall = (struct usyscall *)kalloc()) == 0){
++  freeproc(p);
++  release(&p->lock);
++  return 0;
++}
++p->usyscall->pid = p->pid;
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -158,6 +163,9 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++if(p->usyscall)
++  kfree((void*)p->usyscall);
++p->usyscall = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -201,7 +209,14 @@ proc_pagetable(struct proc *p)
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+-
++if(mappages(pagetable, USYSCALL, PGSIZE,
++            (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, USYSCALL, 1, 0);
++  uvmfree(pagetable, 0);
++  return 0;
++}
+   return pagetable;
+ }
+ 
+@@ -212,6 +227,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, USYSCALL, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..03d1a91 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct usyscall *usyscall;
+ };
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 7f388fe..e85f98c 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -486,19 +486,35 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+   }
+ }
+ 
+-
+-#ifdef LAB_PGTBL
+-void
+-vmprint(pagetable_t pagetable) {
+-  // your code here
+-}
+-#endif
+-
+-
+-
+ #ifdef LAB_PGTBL
+ pte_t*
+ pgpte(pagetable_t pagetable, uint64 va) {
+   return walk(pagetable, va, 0);
+ }
+ #endif
++void
++_vmprint(pagetable_t pagetable, int level)
++{
++  for(int i = 0; i < 512; i++){
++    pte_t pte = pagetable[i];
++    if(pte & PTE_V){
++      for(int j = 0; j < level; j++){
++        if(j > 0) printf(" ");
++        printf("..");
++      }
++      uint64 pa = PTE2PA(pte);
++      printf("%d: pte %p pa %p\n", i, (void*)pte, (void*)pa);
++
++      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
++        _vmprint((pagetable_t)pa, level + 1);
++      }
++    }
++  }
++}
++
++void
++vmprint(pagetable_t pagetable)
++{
++  printf("page table %p\n", pagetable);
++  _vmprint(pagetable, 1);
++}
+diff --git a/source_xv6 b/source_xv6
+new file mode 160000
+index 0000000..8fe399b
+--- /dev/null
++++ b/source_xv6
+@@ -0,0 +1 @@
++Subproject commit 8fe399bfb5a80615398b2a2898ad9275a244837c
+diff --git a/source_xv6 (2) b/source_xv6 (2)
+new file mode 160000
+index 0000000..8fe399b
+--- /dev/null
++++ b/source_xv6 (2)	
+@@ -0,0 +1 @@
++Subproject commit 8fe399bfb5a80615398b2a2898ad9275a244837c
+diff --git a/source_xv6 (3) b/source_xv6 (3)
+new file mode 160000
+index 0000000..8fe399b
+--- /dev/null
++++ b/source_xv6 (3)	
+@@ -0,0 +1 @@
++Subproject commit 8fe399bfb5a80615398b2a2898ad9275a244837c

@@ -1,0 +1,260 @@
+diff --git a/Makefile b/Makefile
+index cd900a8..8073569 100644
+--- a/Makefile
++++ b/Makefile
+@@ -196,8 +196,8 @@ UPROGS=\
+ 	$U/_wc\
+ 	$U/_zombie\
+ 	$U/_tree\
+-
+-
++	$U/_trace\
++	$U/_pinfotest\
+ 
+ ifeq ($(LAB),syscall)
+ UPROGS += \
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 130d9ce..216c5c0 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -295,7 +295,7 @@ fork(void)
+     return -1;
+   }
+   np->sz = p->sz;
+-
++  np->trace_mask = p->trace_mask;
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -693,3 +693,35 @@ procdump(void)
+     printf("\n");
+   }
+ }
++int
++get_procinfo(int pid, uint64 addr)
++{
++  struct proc *p;
++  struct procinfo info;
++  int found = 0;
++
++  // Duyệt qua toàn bộ danh sách tiến trình
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED){
++      // Nếu tìm thấy, chép thông tin vào biến info
++      info.pid = p->pid;
++      info.ppid = p->parent ? p->parent->pid : 0;
++      info.state = p->state;
++      info.sz = p->sz;
++      safestrcpy(info.name, p->name, sizeof(info.name));
++      found = 1;
++      release(&p->lock);
++      break;
++    }
++    release(&p->lock);
++  }
++
++  // Dùng hàm copyout để "bắn" dữ liệu từ Kernel ra ngoài cho User
++  if(found){
++    if(copyout(myproc()->pagetable, addr, (char *)&info, sizeof(info)) < 0)
++      return -1;
++    return 0;
++  }
++  return -1;
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..63a34d7 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,5 +103,6 @@ struct proc {
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
++  char name[16];
++int trace_mask;               // Process name (debugging)
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..50af44c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -7,6 +7,33 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
++static char *syscall_names[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace",
++[SYS_procinfo] "procinfo",
++};
++
++
+ // Fetch the uint64 at addr from the current process.
+ int
+ fetchaddr(uint64 addr, uint64 *ip)
+@@ -101,6 +128,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_procinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,8 +155,11 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_procinfo] sys_procinfo,
+ };
+ 
++
+ void
+ syscall(void)
+ {
+@@ -139,6 +171,11 @@ syscall(void)
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+     p->trapframe->a0 = syscalls[num]();
++    
++    // CODE THÊM MỚI: Kiểm tra xem bit của syscall này có nằm trong mask không
++    if ((p->trace_mask & (1 << num)) != 0) {
++      printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], (int)p->trapframe->a0);
++    }
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..0c7bacc 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_procinfo  23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..f62005a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -91,3 +91,30 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++uint64
++sys_trace(void)
++{
++  int mask;
++  
++  // Lấy tham số từ người dùng (bỏ lệnh if đi)
++  argint(0, &mask);
++  
++  // Lưu mask vào tiến trình hiện tại
++  myproc()->trace_mask = mask;
++  
++  return 0;
++}
++extern int get_procinfo(int pid, uint64 addr);
++
++uint64
++sys_procinfo(void)
++{
++  int pid;
++  uint64 info_addr; // Địa chỉ của con trỏ struct procinfo
++
++  // Lấy 2 tham số: pid và địa chỉ con trỏ info
++  argint(0, &pid);
++  argaddr(1, &info_addr);
++
++  return get_procinfo(pid, info_addr);
++}
+diff --git a/kernel/types.h b/kernel/types.h
+index ee73164..d6f23eb 100644
+--- a/kernel/types.h
++++ b/kernel/types.h
+@@ -8,3 +8,11 @@ typedef unsigned int  uint32;
+ typedef unsigned long uint64;
+ 
+ typedef uint64 pde_t;
++
++struct procinfo {
++  int pid;        // Process ID
++  int ppid;       // Parent process ID
++  int state;      // Process state
++  uint64 sz;      // Size of process memory (bytes)
++  char name[16];  // Process name
++};
+diff --git a/user/pinfotest.c b/user/pinfotest.c
+new file mode 100644
+index 0000000..2fb5dbc
+--- /dev/null
++++ b/user/pinfotest.c
+@@ -0,0 +1,23 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char *argv[]) {
++    struct procinfo info;
++    int target_pid;
++
++    if (argc < 2) {
++        target_pid = getpid(); // Mặc định lấy tiến trình hiện tại
++    } else {
++        target_pid = atoi(argv[1]);
++    }
++
++    if(procinfo(target_pid, &info) == 0){
++        printf("Process: %s\n", info.name);
++        printf("PID: %d, PPID: %d\n", info.pid, info.ppid);
++        printf("State: %d\n", info.state);
++        printf("Memory: %d bytes\n", (int)info.sz);
++    } else {
++        printf("Error: Process not found\n");
++    }
++    exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index f16fe27..240073f 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int procinfo(int, struct procinfo*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..36087ff 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("procinfo");
